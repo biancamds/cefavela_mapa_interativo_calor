@@ -1,0 +1,16 @@
+# ignorar venv
+.venv/
+venv/
+
+# ignorar caches do Python
+__pycache__/
+*.pyc
+
+# ignorar coisas do Jupyter
+.ipynb_checkpoints/
+
+# ignorar OneDrive configs
+*.tmp
+*.lnk
+*.db
+.DS_Store
