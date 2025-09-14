@@ -85,3 +85,11 @@ def zonal_mean(q: PolygonQuery):
             return {"mean": float(np.nanmean(vals.astype(float))), "count": int(vals.size)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "API online – veja /docs"}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
