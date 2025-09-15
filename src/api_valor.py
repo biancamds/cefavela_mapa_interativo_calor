@@ -18,7 +18,7 @@ import numpy as np
 
 
 # -------- config --------
-caminho_geotiff = os.getenv("PATH_GEOTIFF", "./data/raster_html_novo.tif")
+caminho_geotiff = os.getenv("PATH_GEOTIFF", "./data/raster_html.tif")
 
 app = FastAPI()
 app.add_middleware(
