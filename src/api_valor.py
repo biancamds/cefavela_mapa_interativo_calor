@@ -4,20 +4,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import json
+import numpy as np
 
 import rasterio
 from rasterio.warp import transform as rio_transform
-from rasterio.features import geometry_mask
+from rasterio.features import rasterize
+from rasterio.windows import Window, from_bounds, transform as win_transform
 
 from shapely.geometry import shape, mapping, box
 from shapely.ops import transform as shp_transform
 from shapely.validation import explain_validity
 from pyproj import Transformer
 from pyproj.exceptions import ProjError
-import numpy as np
 
 
 # -------- config --------
+# Se quiser apontar para outro .tif no Render, defina a env var PATH_GEOTIFF.
 caminho_geotiff = os.getenv("PATH_GEOTIFF", "./data/raster_html.tif")
 
 app = FastAPI()
@@ -54,19 +56,16 @@ def _close_rings(coords):
             return r + [r[0]]
         return r
 
-    # Heurística: se coords[0][0] é número -> anel simples; senão, anéis aninhados
     try:
+        # Polygon: [ [ [x,y], ... ] , [anel_interno] , ... ]
         if isinstance(coords[0][0][0], (int, float)):
-            # Polygon: [ [ [x,y], ... ] , [anel_interno] , ... ]
             return [close_ring(list(r)) for r in coords]
-        else:
-            # MultiPolygon: [ [ [anel_ext, anel_int... ] ] , [ ... ] ]
-            fixed = []
-            for poly in coords:
-                fixed.append([close_ring(list(r)) for r in poly])
-            return fixed
+        # MultiPolygon: [ [ [anel_ext, anel_int... ] ] , [ ... ] ]
+        fixed = []
+        for poly in coords:
+            fixed.append([close_ring(list(r)) for r in poly])
+        return fixed
     except Exception:
-        # se a heurística falhar, retorna como veio (deixa shapely acusar)
         return coords
 
 
@@ -77,7 +76,6 @@ def _to_src_crs(geom_wgs84, src):
     """
     dst_crs = src.crs
     if not dst_crs:
-        # sem CRS no raster: assume que pixels já estão em WGS84
         return geom_wgs84
     dst = str(dst_crs).upper()
     if dst in ("EPSG:4326", "WGS84"):
@@ -93,12 +91,29 @@ def _to_src_crs(geom_wgs84, src):
         )
 
 
-# -------- endpoints --------
+# -------- endpoints básicos --------
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "API online – veja /docs"}
+
+
+@app.get("/healthz")
+def healthz():
+    # também verifica se o TIFF existe/abre
+    try:
+        with rasterio.open(caminho_geotiff):
+            pass
+        return {"status": "ok", "tif": caminho_geotiff}
+    except Exception as e:
+        return {"status": "degraded", "tif": caminho_geotiff, "detail": str(e)}
+
+
+# -------- /point: leitura super-eficiente (janela 1x1) --------
 @app.post("/point")
 def get_value(q: PointQuery):
     """
     Valor do raster em um ponto (lon/lat WGS84).
-    Usa leitura mascarada: se for NoData, retorna null.
+    Usa leitura 1×1 via Window e respeita NoData.
     """
     try:
         with rasterio.open(caminho_geotiff) as src:
@@ -106,13 +121,13 @@ def get_value(q: PointQuery):
             x, y = xs[0], ys[0]
             row, col = src.index(x, y)
 
-            # fora dos limites
             if row < 0 or col < 0 or row >= src.height or col >= src.width:
                 return {"value": None}
 
-            # leitura mascarada (respeita NoData)
-            band = src.read(1, masked=True)
-            val = band[row, col]
+            # janela 1x1
+            w = Window(col_off=col, row_off=row, width=1, height=1)
+            band = src.read(1, window=w, masked=True)
+            val = band[0, 0]
             if np.ma.is_masked(val):
                 return {"value": None}
             return {"value": float(val)}
@@ -120,12 +135,15 @@ def get_value(q: PointQuery):
         raise HTTPException(status_code=400, detail=f"stage=point | {e}")
 
 
+# -------- /zonal: leitura por janela (bounding box) + rasterize --------
 @app.post("/zonal")
 def zonal_mean(q: PolygonQuery):
     """
     Média do raster dentro de um polígono (GeoJSON em WGS84).
-    Aceita `geometry` como dict ou como string JSON. Fecha anéis e tenta
-    corrigir geometrias inválidas (buffer(0)). Retorna mensagens explicativas.
+    - Normaliza/fecha anéis/valida geometria.
+    - Reprojeta para o CRS do raster.
+    - Lê apenas a janela do bounding box do polígono.
+    - Rasteriza a máscara dentro dessa janela e calcula a média (ignora NoData).
     """
     stage = "start"
     try:
@@ -179,30 +197,59 @@ def zonal_mean(q: PolygonQuery):
                     detail=f"stage=validate | geometria inválida: {before_valid} / após buffer(0): {after_valid}"
                 )
 
-        # 4) abre raster, reprojeta, mascara e calcula
+        # 4) abre raster e processa usando janela mínima
         with rasterio.open(caminho_geotiff) as src:
+            # reprojeta pro CRS do raster
             stage = "reproject"
             geom_proj = _to_src_crs(geom_wgs84, src)
 
+            # checagem de interseção com o raster
             stage = "bounds-check"
-            if not geom_proj.intersects(box(*src.bounds)):
+            rb = box(*src.bounds)
+            if not geom_proj.intersects(rb):
                 return {"mean": None, "count": 0, "note": "geometria não intersecta o raster"}
 
-            stage = "mask"
-            mask = geometry_mask(
-                geometries=[mapping(geom_proj)],
-                out_shape=(src.height, src.width),
-                transform=src.transform,
-                invert=True  # True = interior do polígono é válido
-            )
+            # calcula a janela mínima do bbox da geometria
+            stage = "window"
+            minx, miny, maxx, maxy = geom_proj.bounds
+            win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
 
+            # clamp para garantir que a janela fique dentro do raster
+            col0 = max(0, int(np.floor(win.col_off)))
+            row0 = max(0, int(np.floor(win.row_off)))
+            col1 = min(src.width,  int(np.ceil(win.col_off + win.width)))
+            row1 = min(src.height, int(np.ceil(win.row_off + win.height)))
+            w = Window(col0, row0, col1 - col0, row1 - row0)
+
+            if w.width <= 0 or w.height <= 0:
+                return {"mean": None, "count": 0, "note": "janela vazia"}
+
+            # lê apenas o recorte
+            stage = "read"
+            arr = src.read(1, window=w, masked=False)
+
+            # transform da janela (para rasterizar a máscara na grade do recorte)
+            stage = "window-transform"
+            w_transform = win_transform(w, src.transform)
+
+            # rasteriza a geometria na grade da janela
+            stage = "rasterize"
+            mask_poly = rasterize(
+                [(mapping(geom_proj), 1)],
+                out_shape=(int(w.height), int(w.width)),
+                transform=w_transform,
+                fill=0,
+                dtype="uint8"
+            ).astype(bool)
+
+            # aplica NoData
             stage = "compute"
-            band = src.read(1)
-            valid = mask
-            if src.nodata is not None:
-                valid &= (band != src.nodata)
+            nodata = src.nodata
+            valid = mask_poly
+            if nodata is not None:
+                valid &= (arr != nodata)
 
-            vals = band[valid]
+            vals = arr[valid]
             if vals.size == 0:
                 return {"mean": None, "count": 0, "note": "sem pixels válidos (NoData/fora do raster)"}
 
@@ -215,22 +262,9 @@ def zonal_mean(q: PolygonQuery):
         raise HTTPException(status_code=400, detail=f"{stage=} | {e}")
 
 
-# -------- diagnósticos/saúde --------
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "API online – veja /docs"}
-
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
-
-
+# -------- diagnósticos --------
 @app.post("/echo_geometry")
 def echo_geometry(q: PolygonQuery):
-    """
-    Auxilia a depurar o que o cliente está enviando em `geometry`.
-    """
     gi = q.geometry
     kind = type(gi).__name__
     sample = gi[:200] + "..." if isinstance(gi, str) and len(gi) > 200 else gi
@@ -239,9 +273,6 @@ def echo_geometry(q: PolygonQuery):
 
 @app.post("/zonal_debug")
 def zonal_debug(q: PolygonQuery):
-    """
-    Mostra como a API interpretou a geometria e checks básicos.
-    """
     stage = "start"
     try:
         geom_input = q.geometry
@@ -253,8 +284,10 @@ def zonal_debug(q: PolygonQuery):
         coords = geom_input.get("coordinates")
 
         stage = "close_rings"
-        fixed = {"type": "Polygon" if gtype == "POLYGON" else "MultiPolygon",
-                 "coordinates": _close_rings(coords)}
+        fixed = {
+            "type": "Polygon" if gtype == "POLYGON" else "MultiPolygon",
+            "coordinates": _close_rings(coords)
+        }
         geom_wgs84 = shape(fixed)
 
         info = {
@@ -278,6 +311,16 @@ def zonal_debug(q: PolygonQuery):
                 "raster_crs": str(src.crs),
                 "raster_bounds": list(src.bounds),
             })
+
+            # também reporta a janela calculada
+            minx, miny, maxx, maxy = geom_proj.bounds
+            win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+            col0 = max(0, int(np.floor(win.col_off)))
+            row0 = max(0, int(np.floor(win.row_off)))
+            col1 = min(src.width,  int(np.ceil(win.col_off + win.width)))
+            row1 = min(src.height, int(np.ceil(win.row_off + win.height)))
+            info["window"] = {"col0": col0, "row0": row0, "col1": col1, "row1": row1}
+
         return info
 
     except Exception as e:
